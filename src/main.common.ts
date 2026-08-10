@@ -58,7 +58,8 @@ import '@codingame/monaco-vscode-css-language-features-default-extension'
 import '@codingame/monaco-vscode-markdown-language-features-default-extension'
 import '@codingame/monaco-vscode-emmet-default-extension'
 
-const { getApi } = registerExtension(
+const dummyMainJs = 'data:text/javascript;base64,' + window.btoa('// ucd-main')
+const { getApi, registerFileUrl } = registerExtension(
   {
     name: 'ucd-main',
     publisher: 'ucd',
@@ -66,6 +67,8 @@ const { getApi } = registerExtension(
     engines: {
       vscode: '*'
     },
+    browser: 'extension.js',
+    activationEvents: ['*'],
     contributes: {
       commands: [
         {
@@ -93,8 +96,10 @@ const { getApi } = registerExtension(
       }
     }
   },
-  ExtensionHostKind.LocalProcess
+  ExtensionHostKind.LocalProcess,
+  { system: true }
 )
+registerFileUrl('./extension.js', dummyMainJs)
 
 void getApi().then(async (api) => {
   await registerOpenFolderCommands(api)

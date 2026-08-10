@@ -859,7 +859,8 @@ const { getApi, registerFileUrl } = registerExtension(
         ]
       }
     },
-    ExtensionHostKind.LocalProcess
+    ExtensionHostKind.LocalProcess,
+    { system: true }
   )
 
   registerFileUrl('./extension.js', 'data:text/javascript;base64,' + window.btoa('// ucd-v86-compile'))
