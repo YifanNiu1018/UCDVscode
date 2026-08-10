@@ -218,6 +218,9 @@ export const constructOptions: IWorkbenchConstructionOptions = {
   configurationDefaults: {
     // Same idea as vscode.dev window title, product-named
     'window.title': 'UCDVSC${separator}${dirty}${activeEditorShort}',
+    'workbench.colorTheme': 'Default Dark+',
+    'workbench.iconTheme': 'vs-seti',
+    'terminal.integrated.sendKeybindingsToShell': true,
     // Prefer explorer + editor; welcome still available via Help
     'workbench.startupEditor': 'none',
     'files.autoSave': 'afterDelay',

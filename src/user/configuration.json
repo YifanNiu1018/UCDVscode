@@ -1,6 +1,7 @@
 {
     "workbench.colorTheme": "Default Dark+",
     "workbench.iconTheme": "vs-seti",
+    "terminal.integrated.sendKeybindingsToShell": true,
     "editor.autoClosingBrackets": "languageDefined",
     "editor.autoClosingQuotes": "languageDefined",
     "editor.scrollBeyondLastLine": true,
