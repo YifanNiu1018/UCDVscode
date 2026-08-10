@@ -5,7 +5,7 @@ Offline browser C/C++ IDE: VS Code Workbench + v86 Alpine.
 - Source: [`src/`](src/)
 - Students: download the Release zip and open `ucdvsc.html`
 
-First-time setup (Docker + rustup with `wasm32-unknown-unknown` + make):
+First-time setup (Docker; rustc optional — script downloads prebuilt libv86):
 
 ```bash
 bash scripts/setup-v86.sh          # v86 + Alpine guest + alpine-vfs.js
