@@ -12,7 +12,7 @@ Monaco/VS Code APIs come from npm (`@codingame/monaco-vscode-*@35.0.3`). You do 
 
 ## Setup
 
-Needs Docker (Alpine guest) and rustc/make (libv86).
+Needs Docker (Alpine guest) and rustup + `wasm32-unknown-unknown` + make (libv86).
 
 ```bash
 # from repo root — clones v86, builds emulator + Alpine, packs alpine-vfs.js

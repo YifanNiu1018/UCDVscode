@@ -22,10 +22,25 @@ git fetch --depth 1 origin "$V86_COMMIT" 2>/dev/null || git fetch origin
 git checkout --detach "$V86_COMMIT"
 
 if [[ ! -f build/libv86.js || ! -f build/v86.wasm ]]; then
-  echo "==> build libv86.js + v86.wasm (needs rustc / make; see v86 README)"
+  echo "==> build libv86.js + v86.wasm (needs rustc + wasm32 target; see v86 README)"
   if ! command -v make >/dev/null 2>&1; then
-    echo "make not found. Build v86 yourself, then re-run." >&2
+    echo "make not found. Install make, then re-run." >&2
     exit 1
+  fi
+  if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
+    echo "rustc/cargo not found. Install rustup: https://rustup.rs/" >&2
+    echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+    exit 1
+  fi
+  if ! rustc --print target-list 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
+    echo "wasm32-unknown-unknown target missing." >&2
+    if command -v rustup >/dev/null 2>&1; then
+      echo "==> rustup target add wasm32-unknown-unknown"
+      rustup target add wasm32-unknown-unknown
+    else
+      echo "Install rustup (not apt rustc), then: rustup target add wasm32-unknown-unknown" >&2
+      exit 1
+    fi
   fi
   make all
 fi
