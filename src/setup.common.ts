@@ -96,8 +96,13 @@ export const connectionToken = params.get('connectionToken') ?? undefined
 export const remotePath =
   remoteAuthority != null ? (params.get('remotePath') ?? undefined) : undefined
 export const resetLayout = params.has('resetLayout')
-export const disableShadowDom = params.has('disableShadowDom')
+// Fullscreen app: Shadow DOM makes document.activeElement the host, so VS Code
+// never sees terminalFocus/textInputFocus. Space / Shift+letter then match
+// explorer list keybindings instead of reaching xterm.
+export const disableShadowDom = !params.has('shadowDom')
 params.delete('resetLayout')
+params.delete('disableShadowDom')
+params.delete('shadowDom')
 if (params.get('mode') === 'full-workbench') {
   params.delete('mode')
 }
@@ -220,7 +225,7 @@ export const constructOptions: IWorkbenchConstructionOptions = {
     'window.title': 'UCDVSC${separator}${dirty}${activeEditorShort}',
     'workbench.colorTheme': 'Default Dark+',
     'workbench.iconTheme': 'vs-seti',
-    'terminal.integrated.sendKeybindingsToShell': true,
+    'editor.editContext': false,
     // Prefer explorer + editor; welcome still available via Help
     'workbench.startupEditor': 'none',
     'files.autoSave': 'afterDelay',
