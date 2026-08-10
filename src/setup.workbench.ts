@@ -9,6 +9,8 @@ import {
   disableShadowDom
 } from './setup.common'
 import { hookGalleryWebExtensions, restoreUserExtensions } from './features/installVsix'
+// Side-effect: register ucd-v86-compile before initializeMonacoService (builtin EH snapshot).
+import './features/v86Compile'
 
 // Must run before initializeMonacoService: builtin snapshot is what LocalProcess EH
 // sees on file://. Registering afterwards uses deltaExtensions, which can no-op when

@@ -1121,4 +1121,12 @@ const { getApi, registerFileUrl } = registerExtension(
         void vscode.window.showErrorMessage(err)
       }
     })
+  }).catch((e) => {
+    console.error('[UCD] v86 extension API failed', e)
+    const bar = document.createElement('div')
+    bar.style.cssText =
+      'position:fixed;bottom:0;left:0;right:0;z-index:99999;padding:8px 16px;background:#5a1d1d;color:#f48771;font:13px/1.4 ui-sans-serif,system-ui,sans-serif'
+    bar.textContent =
+      'Alpine/v86 failed to start: ' + (e instanceof Error ? e.message : String(e))
+    document.body.appendChild(bar)
   })
