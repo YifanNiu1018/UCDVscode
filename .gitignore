@@ -1,0 +1,25 @@
+# Product build / deps
+src/node_modules/
+src/dist/
+src/dist-classic/
+src/.vite/
+**/node_modules/
+**/.vite/
+*.tsbuildinfo
+*.log
+.chrome-*
+.DS_Store
+
+# Upstream clones (not this repo)
+monaco-vscode-api/
+v86/
+vscode/
+buildroot/
+
+# Publish package + huge local images
+ucdVscode/
+*.img
+*.iso
+
+instruction/
+agent/

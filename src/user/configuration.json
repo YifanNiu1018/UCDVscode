@@ -1,0 +1,36 @@
+{
+    "workbench.colorTheme": "Default Dark+",
+    "workbench.iconTheme": "vs-seti",
+    "editor.autoClosingBrackets": "languageDefined",
+    "editor.autoClosingQuotes": "languageDefined",
+    "editor.scrollBeyondLastLine": true,
+    "editor.mouseWheelZoom": true,
+    "editor.wordBasedSuggestions": "off",
+    "editor.acceptSuggestionOnEnter": "on",
+    "editor.foldingHighlight": false,
+    "editor.semanticHighlighting.enabled": false,
+    "editor.bracketPairColorization.enabled": false,
+    "editor.fontSize": 13,
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 1000,
+    "debug.toolBarLocation": "docked",
+    "editor.experimental.asyncTokenization": false,
+    "terminal.integrated.tabs.title": "${sequence}",
+    "workbench.sideBar.location": "left",
+    "workbench.startupEditor": "none",
+    "explorer.compactFolders": false,
+    "files.exclude": {
+        "**/.git": true
+    },
+    "files.associations": {
+        "*.c": "c",
+        "*.h": "c",
+        "*.hh": "cpp",
+        "*.hpp": "cpp",
+        "*.hxx": "cpp",
+        "*.cc": "cpp",
+        "*.cpp": "cpp",
+        "*.cxx": "cpp"
+    },
+    "editor.experimental.preferTreeSitter": []
+}

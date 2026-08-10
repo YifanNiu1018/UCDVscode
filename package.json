@@ -1,0 +1,13 @@
+{
+  "name": "ucd",
+  "private": true,
+  "description": "Offline VS Code (monaco-vscode-api) + v86 Alpine. Open ucdVscode/ucdvsc.html",
+  "scripts": {
+    "setup:v86": "bash scripts/setup-v86.sh",
+    "start": "xdg-open ucdVscode/ucdvsc.html",
+    "build": "npm run build --prefix src",
+    "build:classic": "npm run build:classic --prefix src",
+    "rebuild": "npm run rebuild --prefix src",
+    "open": "xdg-open ucdVscode/ucdvsc.html"
+  }
+}
