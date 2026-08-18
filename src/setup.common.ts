@@ -50,15 +50,11 @@ import getWorkspaceTrustOverride from '@codingame/monaco-vscode-workspace-trust-
 import getLogServiceOverride from '@codingame/monaco-vscode-log-service-override'
 import getWorkingCopyServiceOverride from '@codingame/monaco-vscode-working-copy-service-override'
 import getTestingServiceOverride from '@codingame/monaco-vscode-testing-service-override'
-import getChatServiceOverride, {
-  ChatEntitlement
-} from '@codingame/monaco-vscode-chat-service-override'
 import getNotebookServiceOverride from '@codingame/monaco-vscode-notebook-service-override'
 import getWelcomeServiceOverride from '@codingame/monaco-vscode-welcome-service-override'
 import getWalkThroughServiceOverride from '@codingame/monaco-vscode-walkthrough-service-override'
 import getUserDataSyncServiceOverride from '@codingame/monaco-vscode-user-data-sync-service-override'
 import getUserDataProfileServiceOverride from '@codingame/monaco-vscode-user-data-profile-service-override'
-import getAiServiceOverride from '@codingame/monaco-vscode-ai-service-override'
 import getTaskServiceOverride from '@codingame/monaco-vscode-task-service-override'
 import getOutlineServiceOverride from '@codingame/monaco-vscode-outline-service-override'
 import getTimelineServiceOverride from '@codingame/monaco-vscode-timeline-service-override'
@@ -71,15 +67,12 @@ import getMultiDiffEditorServiceOverride from '@codingame/monaco-vscode-multi-di
 import getPerformanceServiceOverride from '@codingame/monaco-vscode-performance-service-override'
 import getRelauncherServiceOverride from '@codingame/monaco-vscode-relauncher-service-override'
 import getShareServiceOverride from '@codingame/monaco-vscode-share-service-override'
-import getSpeechServiceOverride from '@codingame/monaco-vscode-speech-service-override'
 import getSurveyServiceOverride from '@codingame/monaco-vscode-survey-service-override'
 import getUpdateServiceOverride from '@codingame/monaco-vscode-update-service-override'
 import getExplorerServiceOverride from '@codingame/monaco-vscode-explorer-service-override'
 import getLocalizationServiceOverride from '@codingame/monaco-vscode-localization-service-override'
 import getTelemetryServiceOverride from '@codingame/monaco-vscode-telemetry-service-override'
-import getMcpServiceOverride from '@codingame/monaco-vscode-mcp-service-override'
 import getProcessControllerServiceOverride from '@codingame/monaco-vscode-process-explorer-service-override'
-import getImageResizeServiceOverride from '@codingame/monaco-vscode-image-resize-service-override'
 import getAssignmentServiceOverride from '@codingame/monaco-vscode-assignment-service-override'
 import { EnvironmentOverride } from '@codingame/monaco-vscode-api/workbench'
 import { Worker } from './tools/fakeWorker.js'
@@ -91,24 +84,8 @@ import 'vscode/localExtensionHost'
 
 const url = new URL(document.location.href)
 const params = url.searchParams
-export const remoteAuthority = params.get('remoteAuthority') ?? undefined
-export const connectionToken = params.get('connectionToken') ?? undefined
-export const remotePath =
-  remoteAuthority != null ? (params.get('remotePath') ?? undefined) : undefined
-export const resetLayout = params.has('resetLayout')
-// Fullscreen app: Shadow DOM makes document.activeElement the host, so VS Code
-// never sees terminalFocus/textInputFocus. Space / Shift+letter then match
-// explorer list keybindings instead of reaching xterm.
-export const disableShadowDom = !params.has('shadowDom')
+const resetLayout = params.has('resetLayout')
 params.delete('resetLayout')
-params.delete('disableShadowDom')
-params.delete('shadowDom')
-if (params.get('mode') === 'full-workbench') {
-  params.delete('mode')
-}
-if (params.get('ucdTransport') === 'tcp') {
-  params.delete('ucdTransport')
-}
 
 window.history.replaceState({}, document.title, url.href)
 
@@ -146,10 +123,6 @@ registerFileSystemOverlay(1, fileSystemProvider)
 const workers: Partial<Record<string, Worker>> = {
   editorWorkerService: new Worker(
     new URL('monaco-editor/esm/vs/editor/editor.worker.js', import.meta.url),
-    { type: 'module' }
-  ),
-  extensionHostWorkerMain: new Worker(
-    new URL('@codingame/monaco-vscode-api/workers/extensionHost.worker', import.meta.url),
     { type: 'module' }
   ),
   TextMateWorker: new Worker(
@@ -193,9 +166,7 @@ await Promise.all([
 ])
 
 export const constructOptions: IWorkbenchConstructionOptions = {
-  remoteAuthority,
   enableWorkspaceTrust: true,
-  connectionToken,
   windowIndicator: {
     label: '$(vm) UCDVSC',
     tooltip: 'Offline C/C++ IDE — files live in Alpine /root/workspace',
@@ -206,16 +177,7 @@ export const constructOptions: IWorkbenchConstructionOptions = {
     async open() {
       return await openUcdFolder()
     },
-    workspace:
-      remotePath == null
-        ? workspace
-        : {
-            folderUri: monaco.Uri.from({
-              scheme: 'vscode-remote',
-              path: remotePath,
-              authority: remoteAuthority
-            })
-          }
+    workspace
   },
   developmentOptions: {
     logLevel: LogLevel.Info // Default value
@@ -307,21 +269,7 @@ export const commonServices: IEditorOverrideServices = {
   ...getLanguageDetectionWorkerServiceOverride(),
   ...getStorageServiceOverride({
     fallbackOverride: {
-      'workbench.activity.showAccounts': false,
-      /**
-       * VSCode stores in its storage the chat setup state
-       * We need it to be configured out of the box, with is not supported by VSCode
-       * Except if we set the desired state in its storage directly, then it will work as if the user had set it up already
-       */
-      'chat.setupContext': {
-        entitlement: ChatEntitlement.Enterprise,
-        organisations: undefined,
-        sku: undefined,
-        copilotTrackingId: undefined,
-        registered: true,
-        completed: true,
-        installed: true
-      }
+      'workbench.activity.showAccounts': false
     }
   }),
   ...getRemoteAgentServiceOverride({ scanRemoteExtensions: true }),
@@ -331,33 +279,11 @@ export const commonServices: IEditorOverrideServices = {
   ...getWorkingCopyServiceOverride(),
   ...getScmServiceOverride(),
   ...getTestingServiceOverride(),
-  ...getChatServiceOverride({
-    defaultAccount: {
-      entitlementsData: {
-        access_type_sku: 'unused',
-        assigned_date: 'unused',
-        can_signup_for_limited: false,
-        copilot_plan: 'enterprise',
-        organization_login_list: [],
-        analytics_tracking_id: 'unused',
-        chat_enabled: true
-      },
-      accountName: 'unused',
-      authenticationProvider: {
-        id: 'unused',
-        name: 'unused',
-        enterprise: true
-      },
-      enterprise: true,
-      sessionId: 'unused'
-    }
-  }),
   ...getNotebookServiceOverride(),
   ...getWelcomeServiceOverride(),
   ...getWalkThroughServiceOverride(),
   ...getUserDataProfileServiceOverride(),
   ...getUserDataSyncServiceOverride(),
-  ...getAiServiceOverride(),
   ...getTaskServiceOverride(),
   ...getCommentsServiceOverride(),
   ...getEditSessionsServiceOverride(),
@@ -368,7 +294,6 @@ export const commonServices: IEditorOverrideServices = {
   ...getPerformanceServiceOverride(),
   ...getRelauncherServiceOverride(),
   ...getShareServiceOverride(),
-  ...getSpeechServiceOverride(),
   ...getSurveyServiceOverride(),
   ...getUpdateServiceOverride(),
   ...getExplorerServiceOverride(),
@@ -392,8 +317,6 @@ export const commonServices: IEditorOverrideServices = {
   }),
   ...getSecretStorageServiceOverride(),
   ...getTelemetryServiceOverride(),
-  ...getMcpServiceOverride(),
   ...getProcessControllerServiceOverride(),
-  ...getImageResizeServiceOverride(),
   ...getAssignmentServiceOverride()
 }

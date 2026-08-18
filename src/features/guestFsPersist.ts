@@ -147,10 +147,6 @@ export function setGuestDiskBindPrompt(fn: () => void): void {
   onNeedBind = fn
 }
 
-export function isGuestDiskBound(): boolean {
-  return diskDir != null
-}
-
 function openHandleDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(HANDLE_DB, HANDLE_DB_VERSION)

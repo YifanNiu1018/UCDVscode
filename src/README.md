@@ -29,7 +29,7 @@ npm run build:classic              # → ../ucdVscode/
 
 ```
 src/
-  entry.ts, setup.*.ts, main.*.ts, features/
+  main.workbench.ts, setup.*.ts, features/
   guest/                 # Alpine compile_agent + Dockerfile
   build/                 # classic → ucdVscode pack
   offline/               # alpine-vfs.js generator

@@ -1,8 +1,6 @@
 import './style.css'
 import { ExtensionHostKind, registerExtension } from '@codingame/monaco-vscode-api/extensions'
 import { registerGuestWorkspaceFs } from './features/guestFsProvider'
-import './features/terminal'
-import './features/v86Compile'
 import { registerOpenFolderCommands } from './features/openFolder'
 import { installVsixFromFile } from './features/installVsix'
 

@@ -312,14 +312,6 @@ export async function guestWrite(relPath: string, content: string): Promise<void
   }
 }
 
-export async function guestRead(relPath: string): Promise<string> {
-  const r = await guestRpc({ op: 'read', path: relPath })
-  if (!r.ok) {
-    throw new Error(r.stderr || 'read failed')
-  }
-  return r.content ?? ''
-}
-
 /** Open raw shell TCP; caller owns the connection. */
 export function connectGuestShell(): TcpConn {
   const a = getAdapter()

@@ -444,18 +444,6 @@ const html = `<!DOCTYPE html>
       padding: 20px 24px; color: #9cdcfe;
     }
   </style>
-  <script>
-    (function () {
-      if (!location.search) return;
-      var p = new URLSearchParams(location.search);
-      var changed = false;
-      if (p.get('mode') === 'full-workbench') { p.delete('mode'); changed = true; }
-      if (p.get('ucdTransport') === 'tcp') { p.delete('ucdTransport'); changed = true; }
-      if (!changed) return;
-      var q = p.toString();
-      history.replaceState(null, '', location.pathname + (q ? '?' + q : '') + location.hash);
-    })();
-  </script>
 </head>
 <body>
   <div id="ucd-boot">Loading UCDVSC…</div>
