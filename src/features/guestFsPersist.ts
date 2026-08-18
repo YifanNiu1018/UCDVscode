@@ -20,6 +20,11 @@ const OVERLAY_JSON = 'workspace.json'
 const OVERLAY_JS = 'workspace.js'
 const VM_STATE_BIN = 'v86state.bin'
 const VM_STATE_META = 'v86state.json'
+const STATE_DB = 'ucd-vm-state'
+const STATE_STORE = 'state'
+const STATE_BLOB_KEY = 'v86:blob'
+const STATE_META_KEY = 'v86:meta'
+const STATE_DB_VERSION = 1
 
 type StoredDir = { path: string; type: 'dir' }
 type StoredFile = { path: string; type: 'file'; content: string }
@@ -34,6 +39,8 @@ export type Snapshot = {
 declare global {
   interface Window {
     __UCD_GUEST_DISK__?: Snapshot | null
+    /** Set by alpine-vfs.js; must match a saved VM snapshot's baseImageId. */
+    __V86_VFS_ID__?: string
   }
 }
 
@@ -60,11 +67,14 @@ let onNeedBind: (() => void) | null = null
 let vmSaveFn: (() => Promise<ArrayBuffer>) | null = null
 let vmSaving = false
 let vmPersistStarted = false
+let vmDirty = false
 
 export type GuestDiskSaveInfo = {
   savedAt: number
   byteLength?: number
   source: 'vm' | 'workspace'
+  /** alpine-vfs.js __V86_VFS_ID__ at save time; mismatches → cold boot. */
+  baseImageId?: string
 }
 
 let lastSaveInfo: GuestDiskSaveInfo | null = null
@@ -97,6 +107,11 @@ export function onGuestDiskSaved(listener: (info: GuestDiskSaveInfo) => void): (
 
 /** Read last save time from guest-disk meta (no user gesture). */
 export async function loadLastGuestDiskSaveMeta(): Promise<GuestDiskSaveInfo | null> {
+  const fromIdb = await readState<GuestDiskSaveInfo>(STATE_META_KEY)
+  if (fromIdb != null && typeof fromIdb.savedAt === 'number') {
+    noteGuestDiskSaved(fromIdb)
+    return fromIdb
+  }
   const dir = await ensureDiskDir({ prompt: false })
   if (dir != null) {
     const text = await readTextFile(dir, VM_STATE_META)
@@ -145,6 +160,11 @@ export async function loadLastGuestDiskSaveMeta(): Promise<GuestDiskSaveInfo | n
 
 export function setGuestDiskBindPrompt(fn: () => void): void {
   onNeedBind = fn
+}
+
+/** Guest state changed since the last VM snapshot (terminal, edits, compiles). */
+export function markGuestVmDirty(): void {
+  vmDirty = true
 }
 
 function openHandleDb(): Promise<IDBDatabase> {
@@ -196,6 +216,76 @@ async function clearDirHandle(): Promise<void> {
       tx.oncomplete = () => resolve()
       tx.onerror = () => reject(tx.error ?? new Error('indexedDB delete failed'))
       tx.objectStore(HANDLE_STORE).delete(HANDLE_KEY)
+    })
+    db.close()
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * The VM snapshot lives in IndexedDB, not the bound folder: OPFS is refused on
+ * file:// and a File System Access handle loses its permission on every reload,
+ * so only IndexedDB can be read during boot without a user gesture. Blob and
+ * meta are separate keys so reading the timestamp never pulls the whole image.
+ */
+function openStateDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(STATE_DB, STATE_DB_VERSION)
+    req.onupgradeneeded = () => {
+      const db = req.result
+      if (!db.objectStoreNames.contains(STATE_STORE)) {
+        db.createObjectStore(STATE_STORE)
+      }
+    }
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error ?? new Error('indexedDB open failed'))
+  })
+}
+
+async function readState<T>(key: string): Promise<T | undefined> {
+  try {
+    const db = await openStateDb()
+    const row = await new Promise<T | undefined>((resolve, reject) => {
+      const tx = db.transaction(STATE_STORE, 'readonly')
+      const req = tx.objectStore(STATE_STORE).get(key)
+      req.onsuccess = () => resolve(req.result as T | undefined)
+      req.onerror = () => reject(req.error ?? new Error('indexedDB get failed'))
+    })
+    db.close()
+    return row
+  } catch {
+    return undefined
+  }
+}
+
+async function writeState(blob: Blob, meta: GuestDiskSaveInfo): Promise<void> {
+  const db = await openStateDb()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STATE_STORE, 'readwrite')
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error ?? new Error('indexedDB write failed'))
+      tx.onabort = () => reject(tx.error ?? new Error('indexedDB write aborted'))
+      const store = tx.objectStore(STATE_STORE)
+      store.put(blob, STATE_BLOB_KEY)
+      store.put(meta, STATE_META_KEY)
+    })
+  } finally {
+    db.close()
+  }
+}
+
+async function clearState(): Promise<void> {
+  try {
+    const db = await openStateDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STATE_STORE, 'readwrite')
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error ?? new Error('indexedDB delete failed'))
+      const store = tx.objectStore(STATE_STORE)
+      store.delete(STATE_BLOB_KEY)
+      store.delete(STATE_META_KEY)
     })
     db.close()
   } catch {
@@ -383,33 +473,11 @@ export async function bindGuestDiskFolder(): Promise<boolean> {
   return true
 }
 
-export async function hasStoredGuestDiskHandle(): Promise<boolean> {
+async function hasStoredGuestDiskHandle(): Promise<boolean> {
   if (diskDir != null) {
     return true
   }
   return (await loadDirHandle()) != null
-}
-
-/** True if we have a remembered folder but Chrome still needs a click to use it. */
-export async function guestDiskNeedsAuthorization(): Promise<boolean> {
-  const handle = diskDir ?? (await loadDirHandle())
-  if (handle == null) {
-    return false
-  }
-  return (await permissionState(handle as FsHandleWithPerm, 'readwrite')) !== 'granted'
-}
-
-/** Call from a click handler, then reload to restore the VM snapshot. */
-export async function authorizeStoredGuestDisk(): Promise<boolean> {
-  const handle = diskDir ?? (await loadDirHandle())
-  if (handle == null) {
-    return false
-  }
-  const ok = await ensurePermission(handle as FsHandleWithPerm, 'readwrite', true)
-  if (ok) {
-    diskDir = handle
-  }
-  return ok
 }
 
 async function ensureDiskDir(opts: { prompt: boolean }): Promise<FileSystemDirectoryHandle | null> {
@@ -465,13 +533,12 @@ async function loadSnapshot(): Promise<Snapshot | undefined> {
 export async function clearGuestWorkspacePersist(): Promise<void> {
   lastFingerprint = ''
   window.__UCD_GUEST_DISK__ = null
+  await clearVmStateSnapshot()
   const empty: Snapshot = { version: 1, savedAt: Date.now(), entries: [] }
   try {
     const dir = await ensureDiskDir({ prompt: false })
     if (dir != null) {
       await writeSnapshotToDir(dir, empty)
-      await removeFile(dir, VM_STATE_BIN)
-      await removeFile(dir, VM_STATE_META)
       return
     }
   } catch {
@@ -481,20 +548,98 @@ export async function clearGuestWorkspacePersist(): Promise<void> {
   diskDir = null
 }
 
-/** Load full v86 save_state buffer from guest-disk/v86state.bin. */
-export async function loadVmStateBuffer(): Promise<ArrayBuffer | undefined> {
+/** Drop only the full-VM snapshot (IndexedDB + v86state.bin), keep workspace overlay. */
+export async function clearVmStateSnapshot(): Promise<void> {
+  await clearState()
+  try {
+    const dir = await ensureDiskDir({ prompt: false })
+    if (dir != null) {
+      await removeFile(dir, VM_STATE_BIN)
+      await removeFile(dir, VM_STATE_META)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function currentBaseImageId(): string | undefined {
+  const id = window.__V86_VFS_ID__
+  return typeof id === 'string' && id.length > 0 ? id : undefined
+}
+
+/** True when a stored snapshot cannot be safely restored on this alpine-vfs.js. */
+function snapshotBaseImageMismatch(meta: GuestDiskSaveInfo | undefined): boolean {
+  const current = currentBaseImageId()
+  if (current == null) {
+    return false
+  }
+  if (meta?.baseImageId == null || meta.baseImageId === '') {
+    // Saved before we stamped images — unsafe after any guest image rebuild.
+    return true
+  }
+  return meta.baseImageId !== current
+}
+
+/** Load the full v86 save_state buffer: IndexedDB first, then a bound folder. */
+export async function loadVmStateBuffer(
+  onStatus?: (msg: string) => void
+): Promise<ArrayBuffer | undefined> {
+  const meta = await readState<GuestDiskSaveInfo>(STATE_META_KEY)
+  const blob = await readState<Blob>(STATE_BLOB_KEY)
+  if (blob != null && blob.size > 64) {
+    if (snapshotBaseImageMismatch(meta)) {
+      const why =
+        meta?.baseImageId == null
+          ? 'no base-image tag (saved before guest image upgrade)'
+          : `base image changed (${meta.baseImageId} → ${currentBaseImageId()})`
+      console.warn('[ucd] discarding incompatible VM snapshot:', why)
+      onStatus?.(`Discarding stale VM snapshot (${why}) — cold boot`)
+      await clearState()
+      return undefined
+    }
+    return await blob.arrayBuffer()
+  }
   const dir = await ensureDiskDir({ prompt: false })
   if (dir != null) {
+    const fsaMeta = await readFsaVmMeta(dir)
     const fromFsa = await readBinaryFile(dir, VM_STATE_BIN)
     if (fromFsa != null) {
+      if (snapshotBaseImageMismatch(fsaMeta)) {
+        onStatus?.('Discarding stale VM snapshot on disk — cold boot')
+        try {
+          await removeFile(dir, VM_STATE_BIN)
+          await removeFile(dir, VM_STATE_META)
+        } catch {
+          /* ignore */
+        }
+        return undefined
+      }
       return fromFsa
     }
   }
   try {
-    const r = await fetch(new URL('./guest-disk/' + VM_STATE_BIN, document.baseURI).href)
+    const metaUrl = new URL('./guest-disk/' + VM_STATE_META, document.baseURI).href
+    const binUrl = new URL('./guest-disk/' + VM_STATE_BIN, document.baseURI).href
+    let fileMeta: GuestDiskSaveInfo | undefined
+    try {
+      const mr = await fetch(metaUrl)
+      if (mr.ok) {
+        const j = (await mr.json()) as { baseImageId?: string; savedAt?: number }
+        if (typeof j.savedAt === 'number') {
+          fileMeta = { savedAt: j.savedAt, source: 'vm', baseImageId: j.baseImageId }
+        }
+      }
+    } catch {
+      /* file:// CORS or missing meta */
+    }
+    const r = await fetch(binUrl)
     if (r.ok) {
       const buf = await r.arrayBuffer()
       if (buf.byteLength > 64) {
+        if (snapshotBaseImageMismatch(fileMeta)) {
+          onStatus?.('Discarding stale guest-disk/v86state.bin — cold boot')
+          return undefined
+        }
         return buf
       }
     }
@@ -504,58 +649,111 @@ export async function loadVmStateBuffer(): Promise<ArrayBuffer | undefined> {
   return undefined
 }
 
+async function readFsaVmMeta(
+  dir: FileSystemDirectoryHandle
+): Promise<GuestDiskSaveInfo | undefined> {
+  const text = await readTextFile(dir, VM_STATE_META)
+  if (text == null) {
+    return undefined
+  }
+  try {
+    const j = JSON.parse(text) as { savedAt?: number; byteLength?: number; baseImageId?: string }
+    if (typeof j.savedAt !== 'number') {
+      return undefined
+    }
+    return {
+      savedAt: j.savedAt,
+      byteLength: typeof j.byteLength === 'number' ? j.byteLength : undefined,
+      source: 'vm',
+      baseImageId: j.baseImageId
+    }
+  } catch {
+    return undefined
+  }
+}
+
 export async function saveVmStateNow(): Promise<number> {
   if (vmSaveFn == null || vmSaving) {
-    return 0
-  }
-  const dir = await ensureDiskDir({ prompt: false })
-  if (dir == null) {
-    if (!bindPrompted && !(await hasStoredGuestDiskHandle())) {
-      bindPrompted = true
-      onNeedBind?.()
-    }
     return 0
   }
   vmSaving = true
   try {
     const buf = await vmSaveFn()
     const savedAt = Date.now()
-    await writeBinaryFile(dir, VM_STATE_BIN, buf)
-    await writeTextFile(
-      dir,
-      VM_STATE_META,
-      JSON.stringify({
-        version: 1,
-        savedAt,
-        byteLength: buf.byteLength
-      }) + '\n'
-    )
-    noteGuestDiskSaved({ savedAt, byteLength: buf.byteLength, source: 'vm' })
+    const info: GuestDiskSaveInfo = {
+      savedAt,
+      byteLength: buf.byteLength,
+      source: 'vm',
+      baseImageId: currentBaseImageId()
+    }
+    await writeState(new Blob([buf]), info)
+    // A bound folder additionally gets a real file the user can copy elsewhere;
+    // losing that permission must not invalidate the IndexedDB copy.
+    try {
+      const dir = await ensureDiskDir({ prompt: false })
+      if (dir != null) {
+        await writeBinaryFile(dir, VM_STATE_BIN, buf)
+        await writeTextFile(
+          dir,
+          VM_STATE_META,
+          JSON.stringify({
+            version: 1,
+            savedAt,
+            byteLength: buf.byteLength,
+            baseImageId: info.baseImageId
+          }) + '\n'
+        )
+      }
+    } catch (e) {
+      console.warn('[ucd] VM snapshot saved to IndexedDB only', e)
+    }
+    vmDirty = false
+    noteGuestDiskSaved(info)
     return buf.byteLength
   } finally {
     vmSaving = false
   }
 }
 
-/** Periodic + tab-hide full VM snapshot (RAM + 9p + processes). */
+/**
+ * Periodic + tab-hide full VM snapshot (RAM + 9p + processes). Each save stops
+ * the CPU and writes >100 MiB, so it is rate limited: the workspace overlay is
+ * what keeps edits safe, this only exists to skip the next cold boot.
+ */
 export function startGuestVmStatePersist(saveFn: () => Promise<ArrayBuffer>): void {
   vmSaveFn = saveFn
   if (vmPersistStarted) {
     return
   }
   vmPersistStarted = true
-  const flush = (): void => {
+  let lastFlush = 0
+  const flush = (minGapMs: number): void => {
+    if (Date.now() - lastFlush < minGapMs) {
+      return
+    }
+    lastFlush = Date.now()
     void saveVmStateNow().catch((e) => {
       console.warn('[ucd] save VM state failed', e)
     })
   }
-  window.addEventListener('pagehide', flush)
+  // Closing with unsaved guest state asks for confirmation. The dialog is also
+  // the one window in which a >100 MiB write reliably finishes, so the save
+  // starts here: cancelling leaves a saved snapshot and no second prompt.
+  window.addEventListener('beforeunload', (e) => {
+    if (!vmDirty) {
+      return
+    }
+    flush(0)
+    e.preventDefault()
+    e.returnValue = ''
+  })
+  window.addEventListener('pagehide', () => flush(0))
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
-      flush()
+      flush(60_000)
     }
   })
-  window.setInterval(flush, 45000)
+  window.setInterval(() => flush(0), 180_000)
 }
 
 function absPath(parent: string, entry: { name: string; path?: string }): string {
@@ -730,6 +928,7 @@ export async function persistGuestWorkspaceAfterBind(): Promise<{
 }
 
 export function scheduleGuestWorkspacePersist(delayMs = 1200): void {
+  vmDirty = true
   if (debounceTimer != null) {
     window.clearTimeout(debounceTimer)
   }

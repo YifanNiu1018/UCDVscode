@@ -1,10 +1,19 @@
 FROM docker.io/i386/alpine:3.21.0
 
 ENV KERNEL=virt
-# build-base: gcc; nodejs: agent; util-linux: `script` for PTY shell
-ENV ADDPKGS="build-base nodejs util-linux"
+# build-base: gcc; nodejs: agent + pyright; util-linux: `script` for PTY shell;
+# python3: actually run student code (pyright analyses via its own typeshed)
+ENV ADDPKGS="build-base nodejs util-linux python3"
 
 RUN apk add openrc alpine-base agetty alpine-conf linux-$KERNEL linux-firmware-none $ADDPKGS
+
+# Pyright backs the browser's LSP client over the agent's :1236 port. It is pure
+# JS, so npm is only a build-time fetcher; dropping it again keeps ~40 MB of
+# tooling out of the exported rootfs (docker export flattens layers).
+RUN apk add --no-cache npm \
+ && npm install -g --omit=dev pyright@1.1.413 \
+ && apk del npm \
+ && rm -rf /root/.npm /root/.cache /tmp/*
 
 RUN sed -i 's/getty 38400 tty1/agetty --autologin root tty1 linux/' /etc/inittab
 RUN echo 'ttyS0::respawn:/sbin/agetty --autologin root -s ttyS0 115200 vt100' >> /etc/inittab

@@ -1,8 +1,10 @@
 /**
- * Shared TCP bridge to guest compile_agent (control :1234, shell :1235).
+ * Shared TCP bridge to guest compile_agent (control :1234, shell :1235,
+ * language servers :1236).
  */
 export const AGENT_PORT = 1234
 export const SHELL_PORT = 1235
+export const LSP_PORT = 1236
 
 export interface TcpConn {
   on: (event: string, cb: (...args: unknown[]) => void) => void
@@ -34,6 +36,10 @@ export type AgentResponse = {
   entries?: Array<{ name: string; type: string; path: string }>
   work?: string
   code?: string
+  /** `ping`: sha256 of the agent source actually running in the guest. */
+  sha?: string
+  /** `lsp_servers`: server id → installed in the guest image. */
+  servers?: Record<string, boolean>
 }
 
 type ReadyListener = (ready: boolean) => void
@@ -148,21 +154,36 @@ export async function waitForAgentPing(
   delayMs = 1000,
   perTryMs = 4000
 ): Promise<boolean> {
+  return (await probeAgentPing(attempts, delayMs, perTryMs)) != null
+}
+
+/**
+ * Same as waitForAgentPing but hands back the reply, so callers can read the
+ * running agent's `sha` and decide whether it is the version they expect.
+ */
+export async function probeAgentPing(
+  attempts = 15,
+  delayMs = 1000,
+  perTryMs = 4000
+): Promise<AgentResponse | null> {
   const a = getAdapter()
   if (a == null) {
-    return false
+    return null
   }
   for (let i = 0; i < attempts; i++) {
-    const ok = await tryPingOnce(a, perTryMs)
-    if (ok) {
-      return true
+    const reply = await tryPingOnce(a, perTryMs)
+    if (reply != null) {
+      return reply
     }
     await sleep(delayMs)
   }
-  return false
+  return null
 }
 
-function tryPingOnce(a: V86NetworkAdapter, timeoutMs: number): Promise<boolean> {
+function tryPingOnce(
+  a: V86NetworkAdapter,
+  timeoutMs: number
+): Promise<AgentResponse | null> {
   return new Promise((resolve) => {
     let settled = false
     let rx: Uint8Array = new Uint8Array(0)
@@ -170,11 +191,11 @@ function tryPingOnce(a: V86NetworkAdapter, timeoutMs: number): Promise<boolean> 
     try {
       conn = a.connect(AGENT_PORT)
     } catch {
-      resolve(false)
+      resolve(null)
       return
     }
 
-    const finish = (ok: boolean) => {
+    const finish = (reply: AgentResponse | null) => {
       if (settled) {
         return
       }
@@ -184,17 +205,17 @@ function tryPingOnce(a: V86NetworkAdapter, timeoutMs: number): Promise<boolean> 
       } catch {
         /* ignore */
       }
-      resolve(ok)
+      resolve(reply)
     }
 
-    const timer = window.setTimeout(() => finish(false), timeoutMs)
+    const timer = window.setTimeout(() => finish(null), timeoutMs)
 
     conn.on('connect', () => {
       try {
         conn.write(encodeFrame({ op: 'ping' }))
       } catch {
         window.clearTimeout(timer)
-        finish(false)
+        finish(null)
       }
     })
     conn.on('data', (data: unknown) => {
@@ -214,21 +235,21 @@ function tryPingOnce(a: V86NetworkAdapter, timeoutMs: number): Promise<boolean> 
         try {
           const msg = JSON.parse(payload) as AgentResponse
           window.clearTimeout(timer)
-          finish(!!msg.ok && msg.op === 'ping')
+          finish(msg.ok === true && msg.op === 'ping' ? msg : null)
         } catch {
           window.clearTimeout(timer)
-          finish(false)
+          finish(null)
         }
         return
       }
     })
     conn.on('close', () => {
       window.clearTimeout(timer)
-      finish(false)
+      finish(null)
     })
     conn.on('shutdown', () => {
       window.clearTimeout(timer)
-      finish(false)
+      finish(null)
     })
   })
 }
@@ -322,6 +343,23 @@ export function connectGuestShell(): TcpConn {
     throw new Error('guest agent not ready (shell starts with control agent)')
   }
   return a.connect(SHELL_PORT)
+}
+
+/** Open raw LSP TCP; caller sends the handshake and owns the connection. */
+export function connectGuestLsp(): TcpConn {
+  const a = getAdapter()
+  if (a == null) {
+    throw new Error('guest network adapter not set')
+  }
+  if (!controlReady) {
+    throw new Error('guest agent not ready (lsp starts with control agent)')
+  }
+  return a.connect(LSP_PORT)
+}
+
+/** Frame a handshake the way the agent's LSP port expects it. */
+export function encodeLspHandshake(server: string, cwd: string): Uint8Array {
+  return encodeFrame({ server, cwd })
 }
 
 export const GUEST_HOME = '/root'

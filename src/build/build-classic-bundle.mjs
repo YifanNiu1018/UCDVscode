@@ -95,7 +95,12 @@ function rewriteWasmUrls(src, label) {
 }
 
 console.log('==> inline workers as blob URLs')
-const workerFiles = listAssets('worker-', '.js')
+// Vite emits both `worker-<hash>.js` and prefixed ones like
+// `editor.worker-<hash>.js`. Missing the latter left editorWorkerService
+// pointing at a file that is never published (no word-based suggestions).
+const workerFiles = fs
+  .readdirSync(path.join(dist, 'assets'))
+  .filter((f) => /(^|\.)worker-[A-Za-z0-9_-]+\.js$/.test(f))
 const workerMap = {}
 for (const f of workerFiles) {
   workerMap[f] = rewriteWasmUrls(
@@ -125,9 +130,12 @@ function __ucdDynamicImport(spec){
 
 // new URL("worker-XXX.js", import.meta.url) / template / ./worker
 code = code.replace(
-  /new\s+URL\(\s*(["'`])(\.?\/?worker-[A-Za-z0-9_-]+\.js)\1\s*,\s*import\.meta\.url\s*\)/g,
-  (_, _q, name) => {
+  /new\s+URL\(\s*(["'`])(\.?\/?[A-Za-z0-9_.-]*worker-[A-Za-z0-9_-]+\.js)\1\s*,\s*import\.meta\.url\s*\)/g,
+  (match, _q, name) => {
     const base = name.replace(/^\.\//, '')
+    if (workerMap[base] == null) {
+      return match
+    }
     console.log('  worker ref → blob', base)
     return `__ucdWorkerUrl(${JSON.stringify(base)})`
   }
@@ -146,6 +154,11 @@ const assetExtOk = new Set([
   '.png',
   '.ico',
   '.css',
+  // Extension entry points (emmet, *-language-features, …) are plain assets.
+  // Without these the extension host activates them and then dies on
+  // "Failed to fetch", which is why no language provider ever registered.
+  '.js',
+  '.code-snippets',
 ])
 const assetB64 = {}
 let assetBytes = 0
@@ -154,6 +167,8 @@ for (const f of fs.readdirSync(assetDir)) {
   if (!assetExtOk.has(ext)) continue
   // Skip huge KaTeX font pack — not required for Workbench bring-up
   if (f.startsWith('KaTeX_')) continue
+  // Already inlined as a blob URL above; a second copy would just add weight.
+  if (workerMap[f] != null) continue
   const full = path.join(assetDir, f)
   const size = fs.statSync(full).size
   if (size > 2_000_000) {
@@ -176,6 +191,8 @@ const mimeByExt = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.css': 'text/css',
+  '.js': 'text/javascript',
+  '.code-snippets': 'application/json',
 }
 const assetPrelude = `
 globalThis.__UCD_ASSET_B64__ = ${JSON.stringify(assetB64)};

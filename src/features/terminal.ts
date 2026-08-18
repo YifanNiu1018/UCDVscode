@@ -12,6 +12,7 @@ import {
   type TcpConn
 } from './guestBridge'
 import { getGuestFs } from './guestFsProvider'
+import { markGuestVmDirty } from './guestFsPersist'
 
 /**
  * Workbench terminal → guest shell on TCP :1235.
@@ -117,6 +118,7 @@ export class TerminalBackend extends SimpleTerminalBackend {
 
       override input(data: string): void {
         if (!this.fakeMode && this.conn != null) {
+          markGuestVmDirty()
           let echo = ''
           let toGuest = ''
           for (const c of data) {

@@ -15,6 +15,7 @@ import {
   probePort,
   setGuestControlReady,
   setGuestNetworkAdapter,
+  probeAgentPing,
   waitForAgentPing,
   type V86NetworkAdapter
 } from './guestBridge'
@@ -25,20 +26,20 @@ import {
   startGuestWorkspacePersist,
   startGuestVmStatePersist,
   scheduleGuestWorkspacePersist,
+  markGuestVmDirty,
   clearGuestWorkspacePersist,
+  clearVmStateSnapshot,
   bindGuestDiskFolder,
   persistGuestWorkspaceAfterBind,
   setGuestDiskBindPrompt,
-  hasStoredGuestDiskHandle,
   loadVmStateBuffer,
   saveVmStateNow,
-  guestDiskNeedsAuthorization,
-  authorizeStoredGuestDisk,
   loadLastGuestDiskSaveMeta,
   onGuestDiskSaved,
   getLastGuestDiskSave,
   type GuestDiskSaveInfo
 } from './guestFsPersist'
+import { registerGuestLanguageServers } from './lsp'
 import compileAgentSrc from '../guest/compile_agent.js?raw'
 
 declare global {
@@ -46,6 +47,7 @@ declare global {
     V86?: new (options: Record<string, unknown>) => V86Emulator
     __V86_VFS_B64__?: Record<string, string>
     __V86_VFS_READY__?: boolean
+    __V86_VFS_ID__?: string
     __UCD_V86_RUNTIME__?: {
       WASM_B64: string
       BIOS_B64: string
@@ -341,7 +343,7 @@ class V86Compiler {
     onStatus('Looking for VM snapshot (guest-disk/v86state.bin)…')
     let vmState: ArrayBuffer | undefined
     try {
-      vmState = await loadVmStateBuffer()
+      vmState = await loadVmStateBuffer(onStatus)
     } catch (e) {
       onStatus(
         'Snapshot lookup skipped: ' + (e instanceof Error ? e.message : String(e))
@@ -422,16 +424,55 @@ class V86Compiler {
         onStatus(
           `Restoring full VM snapshot (${(vmState.byteLength / (1024 * 1024)).toFixed(1)} MiB)…`
         )
-        await this.emulator.restore_state(vmState)
+        await Promise.race([
+          this.emulator.restore_state(vmState),
+          new Promise<never>((_, reject) =>
+            window.setTimeout(
+              () => reject(new Error('restore_state timed out after 120s')),
+              120_000
+            )
+          )
+        ])
         restoredFromSnapshot = true
       } catch (e) {
         onStatus(
           'Snapshot restore failed — cold boot: ' + (e instanceof Error ? e.message : String(e))
         )
+        try {
+          await clearVmStateSnapshot()
+        } catch {
+          /* best-effort drop of a snapshot that cannot be restored */
+        }
       }
     }
 
     await this.emulator.run?.()
+
+    // A restored snapshot already has DHCP done and the agent process running,
+    // so a short ping decides whether the whole serial bring-up can be skipped.
+    if (restoredFromSnapshot && this.pref !== 'serial') {
+      if (this.emulator.network_adapter != null) {
+        setGuestNetworkAdapter(this.emulator.network_adapter)
+      }
+      onStatus('Snapshot: probing existing agent…')
+      const pong = await probeAgentPing(6, 500, 2000)
+      if (pong != null) {
+        // The snapshot froze an agent *process*; a newer bundled agent means
+        // that process lacks the current ops/ports, so it has to be restarted.
+        const want = await this.bundledAgentSha()
+        if (want == null || pong.sha === want) {
+          this.shellReady = true
+          setGuestControlReady(true)
+          startGuestWorkspacePersist()
+          this.hookVmStatePersist()
+          this.markReady('tcp', onStatus)
+          return
+        }
+        onStatus('Snapshot agent is outdated — restarting it')
+      } else {
+        onStatus('Snapshot agent unreachable — full bring-up')
+      }
+    }
 
     if (restoredFromSnapshot) {
       this.serialSend('\n')
@@ -443,11 +484,14 @@ class V86Compiler {
         onStatus('Snapshot shell ready')
       }
     } else {
-      await this.waitUntilPrompt()
+      await this.waitUntilPromptOrTimeout(120_000, onStatus)
       onStatus('Shell ready')
     }
 
-    await this.prepareGuestServerDir(onStatus)
+    // A snapshot was taken after a successful boot, so the layout is migrated.
+    if (!restoredFromSnapshot) {
+      await this.prepareGuestServerDir(onStatus)
+    }
 
     if (this.pref === 'serial') {
       this.hookVmStatePersist()
@@ -462,7 +506,7 @@ class V86Compiler {
         'udhcpc -i ens3 -n -q 2>/dev/null; ' +
         'echo __UCD_NET__; ip -4 addr show; echo __UCD_NET_END__'
     )
-    await this.waitUntilPrompt()
+    await this.waitUntilPromptOrTimeout(60_000, onStatus)
     {
       const netInfo = this.extractSerialSection('__UCD_NET__', '__UCD_NET_END__')
       if (netInfo) {
@@ -665,6 +709,26 @@ class V86Compiler {
     this.readyWaiters = []
   }
 
+  private waitUntilPromptOrTimeout(
+    ms: number,
+    onStatus?: (msg: string) => void
+  ): Promise<void> {
+    if (this.shellReady) {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        this.shellReady = true
+        onStatus?.('Shell prompt wait timed out — continuing anyway')
+        resolve()
+      }, ms)
+      this.shellWaiters.push(() => {
+        window.clearTimeout(timer)
+        resolve()
+      })
+    })
+  }
+
   private waitUntilPrompt(): Promise<void> {
     if (this.shellReady) {
       return Promise.resolve()
@@ -683,10 +747,47 @@ class V86Compiler {
     })
   }
 
+  private async bundledAgentSha(): Promise<string | null> {
+    try {
+      const digest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(compileAgentSrc)
+      )
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * sha256 of the agent copy already in the guest (baked into the image, or
+   * left by a previous session). The marker is split across two string
+   * literals so the tty echo of the command cannot be read back as the reply.
+   */
+  private async guestAgentSha(): Promise<string | null> {
+    this.serialBuf = ''
+    this.serialSend(
+      `S=$(sha256sum ${AGENT_JS} 2>/dev/null | cut -c1-64); echo "AGENT""SHA:$S:END"`
+    )
+    const m = await this.waitSerialMatch(/AGENTSHA:([0-9a-f]{64})?:END/, 20000)
+    await this.waitUntilPrompt()
+    return m?.[1] ?? null
+  }
+
   /** Push src/guest/compile_agent.js over serial into /root/ucdvsc_server. */
   private async uploadGuestAgent(onStatus: (msg: string) => void): Promise<void> {
+    const want = await this.bundledAgentSha()
+    if (want != null && (await this.guestAgentSha()) === want) {
+      onStatus('Guest agent already current — skipping upload')
+      return
+    }
+
     const b64 = bytesToB64(new TextEncoder().encode(compileAgentSrc))
-    const chunkSize = 2000
+    // The tty line discipline drops canonical lines past ~4 KiB, so each
+    // printf (chunk + wrapper) has to stay comfortably below that.
+    const chunkSize = 3000
     this.serialSend(`mkdir -p ${GUEST_SERVER}; rm -f /tmp/agent.b64 /tmp/compile_agent.js.new\n`)
     await this.waitUntilPrompt()
     for (let i = 0; i < b64.length; i += chunkSize) {
@@ -729,6 +830,25 @@ class V86Compiler {
         }
         if (Date.now() - start > timeoutMs) {
           resolve(false)
+          return
+        }
+        window.setTimeout(tick, 200)
+      }
+      tick()
+    })
+  }
+
+  private waitSerialMatch(re: RegExp, timeoutMs: number): Promise<RegExpMatchArray | null> {
+    const start = Date.now()
+    return new Promise((resolve) => {
+      const tick = () => {
+        const m = this.serialBuf.match(re)
+        if (m != null) {
+          resolve(m)
+          return
+        }
+        if (Date.now() - start > timeoutMs) {
+          resolve(null)
           return
         }
         window.setTimeout(tick, 200)
@@ -799,6 +919,7 @@ class V86Compiler {
       throw new Error('Compile already in progress')
     }
     await this.waitUntilReady()
+    markGuestVmDirty()
     if (this.transport === 'tcp' && isGuestControlReady()) {
       try {
         return await this.compileTcp(code, onStatus)
@@ -953,17 +1074,6 @@ const { getApi, registerFileUrl } = registerExtension(
         })
     })
 
-    if (!(await hasStoredGuestDiskHandle())) {
-      const choice = await vscode.window.showWarningMessage(
-        'UCDVSC needs a folder to store the VM snapshot. Pick the ucdVscode folder.',
-        { modal: true },
-        'Bind Disk Folder…'
-      )
-      if (choice === 'Bind Disk Folder…') {
-        await bindDiskFromUi()
-      }
-    }
-
     async function syncDocument(doc: { uri: { fsPath: string; scheme: string }; getText: () => string }) {
       if (doc.uri.scheme !== 'file' || !isGuestControlReady()) {
         return
@@ -996,30 +1106,6 @@ const { getApi, registerFileUrl } = registerExtension(
 
     if (compiler.isReady) {
       void vscode.window.showInformationMessage('Connected to guest')
-      try {
-        if (await guestDiskNeedsAuthorization()) {
-          void vscode.window
-            .showWarningMessage(
-              'A disk folder is remembered, but the browser needs a click to read the VM snapshot.',
-              'Authorize and Reload'
-            )
-            .then(async (choice) => {
-              if (choice !== 'Authorize and Reload') {
-                return
-              }
-              const ok = await authorizeStoredGuestDisk()
-              if (ok) {
-                window.location.reload()
-              } else {
-                void vscode.window.showErrorMessage(
-                  'Authorization failed. Use Command Palette → UCDVSC: Bind Disk Folder… to pick ucdVscode again.'
-                )
-              }
-            })
-        }
-      } catch {
-        /* ignore */
-      }
       setStatus('Alpine ready')
       void loadLastGuestDiskSaveMeta().then(() => paintSaveStatus())
 
@@ -1028,6 +1114,7 @@ const { getApi, registerFileUrl } = registerExtension(
           await guestRpc({ op: 'mkdir', path: '.' })
           getGuestFs()?.notifyChanged()
           channel.appendLine('explorer: live guest FS ready (file:///workspace → /root/workspace)')
+          registerGuestLanguageServers(vscode, (msg) => channel.appendLine(msg))
           try {
             const doc = await vscode.workspace.openTextDocument(
               vscode.Uri.file('/workspace/main.c')

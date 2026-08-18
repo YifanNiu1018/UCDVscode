@@ -201,6 +201,7 @@
     "@codingame/monaco-vscode-yaml-default-extension": "35.0.3",
     "ansi-colors": "^4.1.3",
     "monaco-editor": "npm:@codingame/monaco-vscode-editor-api@35.0.3",
-    "vscode": "npm:@codingame/monaco-vscode-extension-api@35.0.3"
+    "vscode": "npm:@codingame/monaco-vscode-extension-api@35.0.3",
+    "vscode-languageclient": "^10.1.0"
   }
 }

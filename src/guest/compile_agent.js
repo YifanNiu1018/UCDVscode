@@ -12,6 +12,12 @@
  *   Prefer `script` PTY → persistent /bin/sh -i (cd works).
  *   Fallback: line mode with sticky cwd.
  *
+ * LSP port: LSP_PORT default 1236
+ *   One framed JSON handshake {server, cwd} picks a server from LSP_SERVERS,
+ *   answered by one framed JSON ack. Everything after that is a raw
+ *   bidirectional pipe to the server's stdio — LSP carries its own
+ *   Content-Length framing, so no second envelope is needed.
+ *
  * Workspace: WORK default /root/workspace.
  * Agent files live in /root/ucdvsc_server (not under workspace).
  * Absolute paths under /root and /tmp are allowed; "/" may be listed.
@@ -21,12 +27,77 @@
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const crypto = require("crypto");
 const { spawn, spawnSync } = require("child_process");
+
+/**
+ * sha256 of this very file, reported by `ping`. The browser compares it with
+ * the sha of the agent it bundles, so a restored VM snapshot running an older
+ * agent can be detected and restarted instead of silently missing ops/ports.
+ */
+const SELF_SHA = (() => {
+  // __filename is the normal answer, but it is absent (or wrong) whenever this
+  // file is loaded as an ES module, so fall back to how we were invoked.
+  const candidates = [
+    typeof __filename === "string" ? __filename : null,
+    process.argv[1] || null,
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    if (candidates[i] == null) {
+      continue;
+    }
+    try {
+      return crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(candidates[i]))
+        .digest("hex");
+    } catch (e) {
+      /* try the next candidate */
+    }
+  }
+  return "";
+})();
 
 const PORT = Number(process.env.PORT || 1234);
 const SHELL_PORT = Number(process.env.SHELL_PORT || 1235);
+const LSP_PORT = Number(process.env.LSP_PORT || 1236);
 const WORK = path.resolve(process.env.WORK || "/root/workspace");
 const ALLOW_ROOTS = [path.resolve("/root"), path.resolve("/tmp")];
+
+/**
+ * Language servers the browser may ask for, by id. Keeping this a fixed
+ * registry means the LSP port cannot be used to spawn arbitrary commands.
+ */
+const LSP_SERVERS = {
+  clangd: {
+    cmd: "clangd",
+    args: ["--offset-encoding=utf-16", "--background-index", "--clang-tidy"],
+  },
+  pyright: { cmd: "pyright-langserver", args: ["--stdio"] },
+  typescript: { cmd: "typescript-language-server", args: ["--stdio"] },
+  bash: { cmd: "bash-language-server", args: ["start"] },
+};
+
+function hasCmd(cmd) {
+  try {
+    return spawnSync("which", [cmd], { encoding: "utf8" }).status === 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+let lspAvailCache = null;
+/** id → bool, so the browser only registers providers that can actually run. */
+function lspAvailable() {
+  if (lspAvailCache == null) {
+    lspAvailCache = {};
+    const ids = Object.keys(LSP_SERVERS);
+    for (let i = 0; i < ids.length; i++) {
+      lspAvailCache[ids[i]] = hasCmd(LSP_SERVERS[ids[i]].cmd);
+    }
+  }
+  return lspAvailCache;
+}
 
 function ensureWork() {
   try {
@@ -94,6 +165,17 @@ function handle(msg, socket) {
       stderr: "",
       exit: 0,
       work: WORK,
+      sha: SELF_SHA,
+    });
+    return;
+  }
+
+  if (op === "lsp_servers") {
+    send(socket, {
+      ok: true,
+      op: "lsp_servers",
+      exit: 0,
+      servers: lspAvailable(),
     });
     return;
   }
@@ -639,7 +721,149 @@ function startShellServer() {
   });
 }
 
+function startLspServer() {
+  const server = net.createServer((socket) => {
+    let rx = Buffer.alloc(0);
+    let child = null;
+    let id = "";
+
+    const cleanup = () => {
+      if (child == null) {
+        return;
+      }
+      const c = child;
+      child = null;
+      try {
+        c.kill("SIGKILL");
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const fail = (why) => {
+      console.log("[lsp] " + why);
+      try {
+        send(socket, { ok: false, op: "lsp", stderr: why, exit: 1 });
+      } catch (e) {
+        /* ignore */
+      }
+      cleanup();
+      try {
+        socket.end();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const toChild = (buf) => {
+      if (child == null || !child.stdin.writable) {
+        return;
+      }
+      try {
+        child.stdin.write(buf);
+      } catch (e) {
+        /* server died mid-write; the exit handler closes the socket */
+      }
+    };
+
+    const start = (msg) => {
+      id = String((msg && msg.server) || "");
+      const entry = LSP_SERVERS[id];
+      if (entry == null) {
+        fail("unknown lsp server: " + id);
+        return false;
+      }
+      if (!hasCmd(entry.cmd)) {
+        fail(entry.cmd + " is not installed in the guest");
+        return false;
+      }
+      let cwd = WORK;
+      try {
+        cwd = safePath((msg && msg.cwd) || WORK);
+      } catch (e) {
+        /* fall back to WORK */
+      }
+      try {
+        child = spawn(entry.cmd, entry.args, {
+          cwd,
+          env: Object.assign({}, process.env, { HOME: "/root" }),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (e) {
+        fail("spawn failed: " + String((e && e.message) || e));
+        return false;
+      }
+
+      child.stdout.on("data", (d) => {
+        if (socket.writable) {
+          socket.write(d);
+        }
+      });
+      child.stderr.on("data", (d) => {
+        console.log("[lsp " + id + "] " + String(d).trim());
+      });
+      child.on("error", (e) => {
+        fail("lsp " + id + " error: " + String((e && e.message) || e));
+      });
+      child.on("exit", (codeNum) => {
+        console.log("[lsp " + id + "] exited " + codeNum);
+        child = null;
+        try {
+          socket.end();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+
+      // Ack before any server output so the client can switch to raw mode.
+      send(socket, { ok: true, op: "lsp", exit: 0, code: id, work: cwd });
+      console.log("[lsp " + id + "] started in " + cwd);
+      return true;
+    };
+
+    socket.on("data", (chunk) => {
+      if (child != null) {
+        toChild(chunk);
+        return;
+      }
+      rx = Buffer.concat([rx, chunk]);
+      if (rx.length < 4) {
+        return;
+      }
+      const len = rx.readUInt32BE(0);
+      if (len > 1024 * 1024) {
+        fail("lsp handshake too large");
+        return;
+      }
+      if (rx.length < 4 + len) {
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(rx.subarray(4, 4 + len).toString("utf8"));
+      } catch (e) {
+        fail("bad lsp handshake json: " + e.message);
+        return;
+      }
+      // Anything past the handshake in this segment is already LSP traffic.
+      const rest = rx.subarray(4 + len);
+      rx = Buffer.alloc(0);
+      if (start(msg) && rest.length > 0) {
+        toChild(rest);
+      }
+    });
+
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+  });
+
+  server.listen(LSP_PORT, "0.0.0.0", () => {
+    console.log("agent lsp on 0.0.0.0:" + LSP_PORT);
+  });
+}
+
 ensureWork();
 startControlServer();
 // Defer shell bind slightly so control port comes up first under slow v86.
 setTimeout(startShellServer, 500);
+setTimeout(startLspServer, 800);
