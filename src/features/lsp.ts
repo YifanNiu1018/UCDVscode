@@ -35,6 +35,7 @@ import type * as vscode from 'vscode'
 import {
   GUEST_WORK,
   VSCODE_WORK_ALIAS,
+  concatU8,
   connectGuestLsp,
   encodeLspHandshake,
   guestRpc,
@@ -63,13 +64,6 @@ const HEADER_SEP = '\r\n\r\n'
 const INIT_TIMEOUT_MS = 120_000
 
 type LogFn = (msg: string) => void
-
-function concatU8(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length)
-  out.set(a, 0)
-  out.set(b, a.length)
-  return out
-}
 
 function indexOfHeaderEnd(buf: Uint8Array): number {
   for (let i = 0; i + 3 < buf.length; i++) {
@@ -476,33 +470,60 @@ async function availableServers(): Promise<Record<string, boolean>> {
   }
 }
 
-async function startAll(api: typeof vscode, log: LogFn): Promise<void> {
+/**
+ * Spawn a guest language server only when a matching file is open. Starting
+ * Pyright (a second Node process) on every boot made the v86 guest crawl even
+ * when the user was only editing C.
+ */
+async function startOnDemand(api: typeof vscode, log: LogFn): Promise<void> {
   const avail = await availableServers()
   const usable = SERVERS.filter((s) => avail[s.id] === true)
   if (usable.length === 0) {
     log('LSP: no language servers installed in the guest image')
     return
   }
-  for (const spec of usable) {
-    if (sessions.has(spec.id)) {
-      continue
+  log(
+    'LSP: available ' +
+      usable.map((s) => s.id).join(', ') +
+      ' — start when a matching file is opened'
+  )
+
+  const starting = new Set<string>()
+  const ensure = async (languageId: string): Promise<void> => {
+    for (const spec of usable) {
+      if (!spec.languages.includes(languageId)) {
+        continue
+      }
+      if (sessions.has(spec.id) || starting.has(spec.id)) {
+        continue
+      }
+      starting.add(spec.id)
+      const session = new GuestLspSession(spec, log)
+      sessions.set(spec.id, session)
+      try {
+        await session.start(api)
+      } catch (e) {
+        sessions.delete(spec.id)
+        const msg = e instanceof Error ? e.message : String(e)
+        log(`LSP: ${spec.label} failed — ${msg}`)
+        console.warn(`[UCD] language server ${spec.label} failed:`, e)
+      } finally {
+        starting.delete(spec.id)
+      }
     }
-    const session = new GuestLspSession(spec, log)
-    sessions.set(spec.id, session)
-    try {
-      await session.start(api)
-    } catch (e) {
-      sessions.delete(spec.id)
-      const msg = e instanceof Error ? e.message : String(e)
-      log(`LSP: ${spec.label} failed — ${msg}`)
-      console.warn(`[UCD] language server ${spec.label} failed:`, e)
-    }
+  }
+
+  api.workspace.onDidOpenTextDocument((doc) => {
+    void ensure(doc.languageId)
+  })
+  for (const doc of api.workspace.textDocuments) {
+    void ensure(doc.languageId)
   }
 }
 
 /** Call once guest TCP control is up (from ucd-v86-compile, not ucd-main). */
 export function registerGuestLanguageServers(api: typeof vscode, log: LogFn = console.log): void {
-  void startAll(api, log)
+  void startOnDemand(api, log)
 }
 
 export async function stopGuestLanguageServers(): Promise<void> {

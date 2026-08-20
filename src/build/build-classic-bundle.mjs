@@ -122,8 +122,24 @@ function __ucdWorkerUrl(name){
   if(!u) throw new Error('missing inlined worker: '+name);
   return u;
 }
+var __ucdNativeImport = new Function('u', 'return import(u)');
+function __ucdAssetBasename(u){
+  try {
+    var p = String(u).split('?')[0].split('#')[0];
+    var i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(i + 1) : p;
+  } catch (e) { return ''; }
+}
 function __ucdDynamicImport(spec){
-  console.warn('[UCD] dynamic import stubbed in classic bundle:', spec);
+  try {
+    var name = __ucdAssetBasename(spec);
+    var raw = name && globalThis.__UCD_ASSET_B64__[name];
+    if (raw) {
+      var blob = new Blob([atob(raw)], { type: 'text/javascript' });
+      return __ucdNativeImport(URL.createObjectURL(blob));
+    }
+  } catch (e) {}
+  console.warn('[UCD] dynamic import unavailable in classic bundle:', spec);
   return Promise.reject(new Error('dynamic import unavailable in classic file:// bundle: ' + spec));
 }
 `
@@ -159,6 +175,7 @@ const assetExtOk = new Set([
   // "Failed to fetch", which is why no language provider ever registered.
   '.js',
   '.code-snippets',
+  '.mp3',
 ])
 const assetB64 = {}
 let assetBytes = 0
@@ -193,6 +210,7 @@ const mimeByExt = {
   '.css': 'text/css',
   '.js': 'text/javascript',
   '.code-snippets': 'application/json',
+  '.mp3': 'audio/mpeg',
 }
 const assetPrelude = `
 globalThis.__UCD_ASSET_B64__ = ${JSON.stringify(assetB64)};
@@ -309,32 +327,30 @@ code = code.replace(/\basync\s+__UCD_IMPORT_METHOD__\s*\(/g, 'async import(')
 
 // Vite preload helper injects <link modulepreload/stylesheet> for chunks that
 // are already inside this bundle — on file:// that hits CORS and aborts boot.
-// Replace its exported preload fn `n` with a no-op that just runs the importer.
 {
   const marker = '"dist/assets/preload-helper-'
   const idx = code.indexOf(marker)
   if (idx < 0) {
     console.warn('warning: preload-helper module not found — CSS preload may still fail on file://')
   } else {
-    // Inside the helper factory, `n = function(n26, r25, i25) { ... }`
-    const nAssign = code.indexOf('\n    n = function(', idx)
-    if (nAssign < 0) {
-      console.warn('warning: could not locate preload helper n=function')
+    const assignRe = /\n(\s*)(n\d+)\s*=\s*function\s*\(\s*n\d+\s*,\s*r\d+\s*,\s*i\d+\s*\)\s*\{/
+    const assignMatch = code.slice(idx).match(assignRe)
+    if (!assignMatch) {
+      console.warn('warning: could not locate preload helper n=function (minified names?)')
     } else {
-      // Find matching closing of that function assignment ending at `;\n  }\n});`
-      // Replace from `n = function(` through the end of that function body.
-      const start = nAssign + 1 // skip leading newline
+      const indent = assignMatch[1]
+      const varName = assignMatch[2]
+      const assignIdx = idx + assignMatch.index + 1
+      const braceStart = code.indexOf('{', assignIdx)
       let depth = 0
-      let i = code.indexOf('{', start)
       let end = -1
-      for (; i < code.length; i++) {
+      for (let i = braceStart; i < code.length; i++) {
         const ch = code[i]
         if (ch === '{') depth++
         else if (ch === '}') {
           depth--
           if (depth === 0) {
             end = i + 1
-            // consume trailing `;` if present
             if (code[end] === ';') end++
             break
           }
@@ -344,11 +360,11 @@ code = code.replace(/\basync\s+__UCD_IMPORT_METHOD__\s*\(/g, 'async import(')
         console.warn('warning: failed to parse preload helper function bounds')
       } else {
         const stub =
-          'n = function(n26) {\n' +
-          '      // classic bundle: deps already inlined — skip link preload\n' +
-          '      return Promise.resolve().then(function(){ return n26(); });\n' +
-          '    };'
-        code = code.slice(0, start) + stub + code.slice(end)
+          `${indent}${varName} = function(n17) {\n` +
+          `${indent}  // classic bundle: deps already inlined — skip link preload (file:// CORS)\n` +
+          `${indent}  return Promise.resolve().then(function(){ return n17(); });\n` +
+          `${indent}};`
+        code = code.slice(0, assignIdx) + stub + code.slice(end)
         console.log('==> stubbed Vite preload helper (no file:// CSS/modulepreload)')
       }
     }
@@ -478,7 +494,7 @@ Open [ucdvsc.html](ucdvsc.html).
 
 First time: Command Palette → **UCDVSC: Bind Disk Folder…**, pick this folder.
 
-Snapshot: \`guest-disk/v86state.bin\` (tab close / every 45s / Save VM Snapshot). Reopen to restore RAM, processes, and filesystem.
+Snapshot: \`guest-disk/v86state.bin\` (tab close / when changed, at most every 10 min / Save VM Snapshot). Reopen to restore RAM, processes, and filesystem.
 `
 )
 

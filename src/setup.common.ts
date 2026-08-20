@@ -195,6 +195,8 @@ export const constructOptions: IWorkbenchConstructionOptions = {
     'editor.experimental.asyncTokenization': false,
     'editor.experimental.preferTreeSitter': [],
     'editor.semanticHighlighting.enabled': false,
+    'debug.allowBreakpointsEverywhere': true,
+    'editor.glyphMargin': true,
     'files.associations': {
       '*.c': 'c',
       '*.h': 'c',

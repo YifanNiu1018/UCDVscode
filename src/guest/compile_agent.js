@@ -18,6 +18,15 @@
  *   bidirectional pipe to the server's stdio — LSP carries its own
  *   Content-Length framing, so no second envelope is needed.
  *
+ * Debug port: DEBUG_PORT default 1237
+ *   Same handshake shape; only `gdb` is allowed. After the ack the socket
+ *   carries raw GDB/MI lines (newline-delimited).
+ *
+ * Debug TTY port: DEBUG_TTY_PORT default 1238
+ *   One framed handshake, then the ack carries {tty} — a real /dev/pts the
+ *   debugged program uses for stdio (gdb `-inferior-tty-set`). After the ack
+ *   the socket is a raw pipe to that PTY master (browser terminal <-> program).
+ *
  * Workspace: WORK default /root/workspace.
  * Agent files live in /root/ucdvsc_server (not under workspace).
  * Absolute paths under /root and /tmp are allowed; "/" may be listed.
@@ -61,6 +70,8 @@ const SELF_SHA = (() => {
 const PORT = Number(process.env.PORT || 1234);
 const SHELL_PORT = Number(process.env.SHELL_PORT || 1235);
 const LSP_PORT = Number(process.env.LSP_PORT || 1236);
+const DEBUG_PORT = Number(process.env.DEBUG_PORT || 1237);
+const DEBUG_TTY_PORT = Number(process.env.DEBUG_TTY_PORT || 1238);
 const WORK = path.resolve(process.env.WORK || "/root/workspace");
 const ALLOW_ROOTS = [path.resolve("/root"), path.resolve("/tmp")];
 
@@ -76,6 +87,10 @@ const LSP_SERVERS = {
   pyright: { cmd: "pyright-langserver", args: ["--stdio"] },
   typescript: { cmd: "typescript-language-server", args: ["--stdio"] },
   bash: { cmd: "bash-language-server", args: ["start"] },
+};
+
+const DEBUG_SERVERS = {
+  gdb: { cmd: "gdb", args: ["-i=mi", "--quiet"] },
 };
 
 function hasCmd(cmd) {
@@ -176,6 +191,109 @@ function handle(msg, socket) {
       op: "lsp_servers",
       exit: 0,
       servers: lspAvailable(),
+    });
+    return;
+  }
+
+  if (op === "debug_ready") {
+    send(socket, {
+      ok: true,
+      op: "debug_ready",
+      exit: 0,
+      gdb: hasCmd("gdb"),
+      pty: hasCmd("python3"),
+    });
+    return;
+  }
+
+  if (op === "debug_compile") {
+    const name =
+      String(msg.name || "main.c").replace(/[^a-zA-Z0-9._/-]/g, "") || "main.c";
+    const code = msg.code != null ? String(msg.code) : null;
+    let srcPath;
+    try {
+      srcPath = safePath(name);
+      fs.mkdirSync(path.dirname(srcPath), { recursive: true });
+      if (code != null) {
+        fs.writeFileSync(srcPath, code, "utf8");
+      } else if (!fs.existsSync(srcPath)) {
+        send(socket, {
+          ok: false,
+          op: "debug_compile",
+          stderr: "source missing: " + name,
+          exit: 1,
+        });
+        return;
+      }
+    } catch (e) {
+      send(socket, {
+        ok: false,
+        op: "debug_compile",
+        stderr: "write failed: " + e.message,
+        exit: 1,
+      });
+      return;
+    }
+
+    let outBin;
+    if (msg.out) {
+      try {
+        outBin = safePath(String(msg.out));
+      } catch (e) {
+        outBin = path.join(WORK, "a.out");
+      }
+    } else {
+      let base = name;
+      if (base.endsWith(".c")) {
+        base = base.slice(0, -2);
+      } else {
+        const dot = base.lastIndexOf(".");
+        if (dot > 0) {
+          base = base.slice(0, dot);
+        }
+      }
+      if (!base) {
+        base = "a.out";
+      }
+      try {
+        outBin = safePath(base);
+      } catch (e) {
+        outBin = path.join(WORK, "a.out");
+      }
+    }
+
+    // -static-pie (gcc default with -static on Alpine) leaves gdb unable to
+    // find function bounds on i386, so step/continue fail. Force a classic
+    // non-PIE static binary with a frame pointer and DWARF 4.
+    const compile = spawnSync(
+      "gcc",
+      [
+        "-g3",
+        "-O0",
+        "-gdwarf-4",
+        "-fno-omit-frame-pointer",
+        "-fno-pie",
+        "-static",
+        "-no-pie",
+        "-o",
+        outBin,
+        srcPath,
+      ],
+      {
+        cwd: WORK,
+        encoding: "utf8",
+        timeout: 60000,
+      }
+    );
+
+    send(socket, {
+      ok: compile.status === 0,
+      op: "debug_compile",
+      path: absPosix(outBin),
+      src: absPosix(srcPath),
+      stdout: compile.stdout || "",
+      stderr: compile.stderr || "",
+      exit: compile.status == null ? 1 : compile.status,
     });
     return;
   }
@@ -459,7 +577,7 @@ function handle(msg, socket) {
     ok: false,
     op: op || "unknown",
     stderr:
-      "unsupported op (ping|compile|write|read|list|mkdir|unlink|exec|stat|rename)",
+      "unsupported op (ping|compile|debug_compile|debug_ready|write|read|list|mkdir|unlink|exec|stat|rename|lsp_servers)",
     exit: 1,
   });
 }
@@ -862,8 +980,328 @@ function startLspServer() {
   });
 }
 
+function startDebugServer() {
+  const server = net.createServer((socket) => {
+    let rx = Buffer.alloc(0);
+    let child = null;
+
+    const cleanup = () => {
+      if (child == null) {
+        return;
+      }
+      const c = child;
+      child = null;
+      try {
+        c.kill("SIGKILL");
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const fail = (why) => {
+      console.log("[debug] " + why);
+      try {
+        send(socket, { ok: false, op: "debug", stderr: why, exit: 1 });
+      } catch (e) {
+        /* ignore */
+      }
+      cleanup();
+      try {
+        socket.end();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const toChild = (buf) => {
+      if (child == null || !child.stdin.writable) {
+        return;
+      }
+      try {
+        child.stdin.write(buf);
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const start = (msg) => {
+      const id = String((msg && msg.server) || "");
+      const entry = DEBUG_SERVERS[id];
+      if (entry == null) {
+        fail("unknown debug backend: " + id);
+        return false;
+      }
+      if (!hasCmd(entry.cmd)) {
+        fail(entry.cmd + " is not installed in the guest");
+        return false;
+      }
+      let cwd = WORK;
+      try {
+        cwd = safePath((msg && msg.cwd) || WORK);
+      } catch (e) {
+        /* fall back */
+      }
+      try {
+        child = spawn(entry.cmd, entry.args, {
+          cwd,
+          env: Object.assign({}, process.env, { HOME: "/root" }),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (e) {
+        fail("spawn failed: " + String((e && e.message) || e));
+        return false;
+      }
+
+      child.stdout.on("data", (d) => {
+        if (socket.writable) {
+          socket.write(d);
+        }
+      });
+      child.stderr.on("data", (d) => {
+        console.log("[debug gdb] " + String(d).trim());
+      });
+      child.on("error", (e) => {
+        fail("gdb error: " + String((e && e.message) || e));
+      });
+      child.on("exit", (codeNum) => {
+        console.log("[debug gdb] exited " + codeNum);
+        child = null;
+        try {
+          socket.end();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+
+      send(socket, { ok: true, op: "debug", exit: 0, code: id, work: cwd });
+      console.log("[debug gdb] started in " + cwd);
+      return true;
+    };
+
+    socket.on("data", (chunk) => {
+      if (child != null) {
+        toChild(chunk);
+        return;
+      }
+      rx = Buffer.concat([rx, chunk]);
+      if (rx.length < 4) {
+        return;
+      }
+      const len = rx.readUInt32BE(0);
+      if (len > 1024 * 1024) {
+        fail("debug handshake too large");
+        return;
+      }
+      if (rx.length < 4 + len) {
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(rx.subarray(4, 4 + len).toString("utf8"));
+      } catch (e) {
+        fail("bad debug handshake json: " + e.message);
+        return;
+      }
+      const rest = rx.subarray(4 + len);
+      rx = Buffer.alloc(0);
+      if (start(msg) && rest.length > 0) {
+        toChild(rest);
+      }
+    });
+
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+  });
+
+  server.listen(DEBUG_PORT, "0.0.0.0", () => {
+    console.log("agent debug on 0.0.0.0:" + DEBUG_PORT);
+  });
+}
+
+/**
+ * Python allocates a real PTY, prints its slave path (/dev/pts/N) to stderr,
+ * then relays the master fd <-> its own stdin/stdout. gdb runs the inferior on
+ * that slave via `-inferior-tty-set`, so the debugged program gets a terminal
+ * (line-buffered stdout, working stdin). The slave fd is held open so the pty
+ * survives between runs. Node has no PTY without a native module; python3 does.
+ */
+const DEBUG_TTY_PY = [
+  "import os,sys,select",
+  "mfd,sfd=os.openpty()",
+  "sys.stderr.write('TTY:'+os.ttyname(sfd)+chr(10));sys.stderr.flush()",
+  "os.set_blocking(mfd,False)",
+  "sin=0;sout=1",
+  "try:",
+  " while True:",
+  "  r,_,_=select.select([mfd,sin],[],[])",
+  "  if mfd in r:",
+  "   try:",
+  "    d=os.read(mfd,65536)",
+  "   except OSError:",
+  "    d=b''",
+  "   if d:",
+  "    os.write(sout,d)",
+  "  if sin in r:",
+  "   d=os.read(sin,65536)",
+  "   if not d:",
+  "    break",
+  "   os.write(mfd,d)",
+  "except Exception:",
+  " pass",
+].join("\n");
+
+function startDebugTtyServer() {
+  const server = net.createServer((socket) => {
+    let rx = Buffer.alloc(0);
+    let child = null;
+    let acked = false;
+    let errbuf = "";
+
+    const cleanup = () => {
+      if (child == null) {
+        return;
+      }
+      const c = child;
+      child = null;
+      try {
+        c.kill("SIGKILL");
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const fail = (why) => {
+      console.log("[debugtty] " + why);
+      if (!acked) {
+        try {
+          send(socket, { ok: false, op: "debugtty", stderr: why, exit: 1 });
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      cleanup();
+      try {
+        socket.end();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    const start = (msg) => {
+      if (!hasCmd("python3")) {
+        fail("python3 is not installed in the guest");
+        return false;
+      }
+      let cwd = WORK;
+      try {
+        cwd = safePath((msg && msg.cwd) || WORK);
+      } catch (e) {
+        /* fall back */
+      }
+      try {
+        child = spawn("python3", ["-c", DEBUG_TTY_PY], {
+          cwd,
+          env: Object.assign({}, process.env, { HOME: "/root" }),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (e) {
+        fail("spawn failed: " + String((e && e.message) || e));
+        return false;
+      }
+
+      child.stderr.on("data", (d) => {
+        if (acked) {
+          return;
+        }
+        errbuf += d.toString("utf8");
+        const nl = errbuf.indexOf("\n");
+        if (nl < 0) {
+          return;
+        }
+        const line = errbuf.slice(0, nl).trim();
+        const m = /^TTY:(.+)$/.exec(line);
+        if (m == null) {
+          fail("broker: " + line);
+          return;
+        }
+        acked = true;
+        send(socket, { ok: true, op: "debugtty", exit: 0, tty: m[1] });
+        console.log("[debugtty] inferior tty " + m[1] + " in " + cwd);
+      });
+      // Master output (the program's stdout/stderr) → browser terminal.
+      child.stdout.on("data", (d) => {
+        if (socket.writable) {
+          socket.write(d);
+        }
+      });
+      child.on("error", (e) => fail("broker error: " + String((e && e.message) || e)));
+      child.on("exit", (codeNum) => {
+        console.log("[debugtty] broker exited " + codeNum);
+        child = null;
+        try {
+          socket.end();
+        } catch (e) {
+          /* ignore */
+        }
+      });
+      return true;
+    };
+
+    socket.on("data", (chunk) => {
+      // After the handshake, everything is raw keystrokes → broker stdin → pty.
+      if (child != null) {
+        if (child.stdin.writable) {
+          try {
+            child.stdin.write(chunk);
+          } catch (e) {
+            /* broker died; exit handler closes the socket */
+          }
+        }
+        return;
+      }
+      rx = Buffer.concat([rx, chunk]);
+      if (rx.length < 4) {
+        return;
+      }
+      const len = rx.readUInt32BE(0);
+      if (len > 1024 * 1024) {
+        fail("debugtty handshake too large");
+        return;
+      }
+      if (rx.length < 4 + len) {
+        return;
+      }
+      let msg;
+      try {
+        msg = JSON.parse(rx.subarray(4, 4 + len).toString("utf8"));
+      } catch (e) {
+        fail("bad debugtty handshake json: " + e.message);
+        return;
+      }
+      const rest = rx.subarray(4 + len);
+      rx = Buffer.alloc(0);
+      if (start(msg) && rest.length > 0 && child != null && child.stdin.writable) {
+        try {
+          child.stdin.write(rest);
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    });
+
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+  });
+
+  server.listen(DEBUG_TTY_PORT, "0.0.0.0", () => {
+    console.log("agent debugtty on 0.0.0.0:" + DEBUG_TTY_PORT);
+  });
+}
+
 ensureWork();
 startControlServer();
 // Defer shell bind slightly so control port comes up first under slow v86.
 setTimeout(startShellServer, 500);
 setTimeout(startLspServer, 800);
+setTimeout(startDebugServer, 1000);
+setTimeout(startDebugTtyServer, 1200);

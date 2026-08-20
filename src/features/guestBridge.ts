@@ -1,10 +1,13 @@
 /**
  * Shared TCP bridge to guest compile_agent (control :1234, shell :1235,
- * language servers :1236).
+ * language servers :1236, gdb/MI :1237).
  */
 export const AGENT_PORT = 1234
 export const SHELL_PORT = 1235
 export const LSP_PORT = 1236
+export const DEBUG_PORT = 1237
+/** Real PTY for the debugged program's stdio (interactive stdin + live output). */
+export const DEBUG_TTY_PORT = 1238
 
 export interface TcpConn {
   on: (event: string, cb: (...args: unknown[]) => void) => void
@@ -40,6 +43,10 @@ export type AgentResponse = {
   sha?: string
   /** `lsp_servers`: server id → installed in the guest image. */
   servers?: Record<string, boolean>
+  /** `debug_ready`: gdb available in the guest image. */
+  gdb?: boolean
+  /** `debug_compile`: guest path to the debug binary. */
+  src?: string
 }
 
 type ReadyListener = (ready: boolean) => void
@@ -107,7 +114,7 @@ function encodeFrame(obj: unknown): Uint8Array {
   return frame
 }
 
-function concatU8(a: Uint8Array, b: Uint8Array): Uint8Array {
+export function concatU8(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length)
   out.set(a, 0)
   out.set(b, a.length)
@@ -362,6 +369,40 @@ export function encodeLspHandshake(server: string, cwd: string): Uint8Array {
   return encodeFrame({ server, cwd })
 }
 
+/** Open raw gdb/MI TCP; caller sends the handshake and owns the connection. */
+export function connectGuestDebug(): TcpConn {
+  const a = getAdapter()
+  if (a == null) {
+    throw new Error('guest network adapter not set')
+  }
+  if (!controlReady) {
+    throw new Error('guest agent not ready (debug starts with control agent)')
+  }
+  return a.connect(DEBUG_PORT)
+}
+
+/** Frame a handshake the way the agent's debug port expects it. */
+export function encodeDebugHandshake(cwd: string): Uint8Array {
+  return encodeFrame({ server: 'gdb', cwd })
+}
+
+/** Open the debug-inferior PTY bridge; caller sends the handshake and owns it. */
+export function connectGuestDebugTty(): TcpConn {
+  const a = getAdapter()
+  if (a == null) {
+    throw new Error('guest network adapter not set')
+  }
+  if (!controlReady) {
+    throw new Error('guest agent not ready (debug tty starts with control agent)')
+  }
+  return a.connect(DEBUG_TTY_PORT)
+}
+
+/** Frame a handshake the way the agent's debug-tty port expects it. */
+export function encodeDebugTtyHandshake(cwd: string): Uint8Array {
+  return encodeFrame({ server: 'debugtty', cwd })
+}
+
 export const GUEST_HOME = '/root'
 export const GUEST_WORK = '/root/workspace'
 /** Guest-side UCDVSC agent (compile + shell), not student files. */
@@ -406,9 +447,4 @@ export function guestPathToVscode(guestAbs: string): string {
 
 export function isGuestFsVscodePath(fsPath: string): boolean {
   return vscodePathToGuest(fsPath) != null
-}
-
-/** @deprecated use vscodePathToGuest — still returns a guest path for RPC. */
-export function browserPathToGuest(fsPath: string): string | null {
-  return vscodePathToGuest(fsPath)
 }

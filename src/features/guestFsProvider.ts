@@ -49,6 +49,7 @@ export class GuestWorkspaceFileSystemProvider {
   readonly onDidChangeFile: Event<readonly IFileChange[]> = this._onDidChangeFile.event
 
   private pollTimer: number | null = null
+  private pollBusy = false
   private lastFingerprint = ''
   /** Guest abs path currently shown as explorer root (for poll). */
   private watchGuestPath = GUEST_WORK
@@ -100,7 +101,7 @@ export class GuestWorkspaceFileSystemProvider {
     this.stopPolling()
     this.pollTimer = window.setInterval(() => {
       void this.pollOnce()
-    }, 2500)
+    }, 8000)
   }
 
   private stopPolling(): void {
@@ -111,9 +112,10 @@ export class GuestWorkspaceFileSystemProvider {
   }
 
   private async pollOnce(): Promise<void> {
-    if (!isGuestControlReady()) {
+    if (!isGuestControlReady() || document.visibilityState === 'hidden' || this.pollBusy) {
       return
     }
+    this.pollBusy = true
     try {
       const fp = await this.fingerprint(this.watchGuestPath)
       if (fp !== this.lastFingerprint) {
@@ -122,6 +124,8 @@ export class GuestWorkspaceFileSystemProvider {
       }
     } catch {
       /* ignore poll errors */
+    } finally {
+      this.pollBusy = false
     }
   }
 

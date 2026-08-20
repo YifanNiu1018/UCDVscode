@@ -10,6 +10,10 @@ import { hookGalleryWebExtensions, restoreUserExtensions } from './features/inst
 import './builtinExtensions'
 // Side-effect: register ucd-v86-compile before initializeMonacoService (builtin EH snapshot).
 import './features/v86Compile'
+import { registerGuestWorkspaceFs } from './features/guestFsProvider'
+
+// Overlay must exist before initializeMonacoService validates file:///workspace.
+registerGuestWorkspaceFs()
 
 let container = document.createElement('div')
 container.style.height = '100vh'
